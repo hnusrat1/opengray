@@ -1,0 +1,29 @@
+# Local data, model credentials, and experiment artifacts
+data/raw/
+data/cache/
+data/results/
+data/audit/
+data/feasibility/
+data/reference_scores/
+data/splits/
+runs/
+.secrets/
+.env
+.env.*
+*.key
+*.pem
+
+# Python and local tools
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.hypothesis/
+.DS_Store
+.idea/
+.vscode/

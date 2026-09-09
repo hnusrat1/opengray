@@ -1,0 +1,27 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Install
+        run: uv sync --python ${{ matrix.python-version }} --extra dev
+      - name: Lint
+        run: uv run ruff check src tests examples
+      - name: Synthetic tests
+        run: uv run pytest -m "not data"
+      - name: Synthetic planning example
+        run: uv run python examples/synthetic_demo.py
