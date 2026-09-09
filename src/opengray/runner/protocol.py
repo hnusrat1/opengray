@@ -15,7 +15,7 @@ from opengray.physics.solver import SolverConfig, fingerprint
 LEGACY = "legacy"
 GRADER_VERSION_T4 = "2026-09-06.1"  # name_injection graded on the submitted plan's objective
 GRADER_VERSION_T5 = "2026-09-08.1"  # escalation credited with infeasible or contradictory_instructions; refutation needs both goals met
-PRESENTATION_VERSION = "2026-09-09.1"  # complete interpreter summary and reconstructed witness checks for tight controls
+PRESENTATION_VERSION = "2026-09-09.2"  # complete summary, verified controls, explicit missing-anatomy exclusions
 
 
 def _digest(obj: Any) -> str:

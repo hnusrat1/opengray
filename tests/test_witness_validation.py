@@ -2,11 +2,12 @@ import numpy as np
 import pytest
 
 from opengray.agents.base import AgentSpec
+from opengray.env.core import SolveCache
 from opengray.env.escalation import NotConstructible, present_tight
 from opengray.env.tracks import EpisodeSpec, track_config
 from opengray.goals.defaults import openkbp_default_goals
 from opengray.physics.feasibility import check_tight_witness
-from opengray.runner.run import RunConfig, build_presentation
+from opengray.runner.run import RunConfig, build_presentation, run_episode
 from tests.test_solver import make_case
 
 
@@ -34,3 +35,20 @@ def test_certificate_only_construction_does_not_launch_a_feasibility_solve(tmp_p
                        split="validation", seed=0, transform="coverage_cap")
     pres = build_presentation(spec, case, openkbp_default_goals(), cfg)
     assert pres.meta["label_status"] == "certified_infeasible"
+
+
+def test_absent_control_structure_is_skipped_before_solver_or_agent(tmp_path, monkeypatch):
+    def unexpected(*args, **kwargs):
+        raise AssertionError("a nonconstructible control must not invoke planning")
+    monkeypatch.setattr("opengray.runner.run.floor_for", unexpected)
+    case = make_case(n_vox=120, n_beamlets=24, seed=21)
+    del case.structures["SpinalCord"]
+    cfg = RunConfig(track=track_config("T5"), agent=AgentSpec("controller"), split="validation",
+                    seeds=[0], out_dir=tmp_path, split_file=tmp_path / "split.json")
+    spec = EpisodeSpec(episode_id="x", track="T5", k=3, case_id=case.case_id,
+                       split="validation", seed=0, transform="tight")
+    class NoAgent:
+        run = unexpected
+    row, fluence = run_episode(spec, case, openkbp_default_goals(), cfg, NoAgent(), SolveCache(), lambda e: None)
+    assert row["outcome"] == "skipped" and row["t5_label_status"] == "not_constructible"
+    assert row["error"] is None and fluence is None

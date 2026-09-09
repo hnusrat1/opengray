@@ -177,6 +177,8 @@ def build_presentation(spec: EpisodeSpec, case: Case, goals: GoalList, cfg: RunC
         return None
     if spec.track == "T5":
         feasibility = None
+        if spec.transform == "tight" and "SpinalCord" not in case.structures:
+            raise NotConstructible(f"{case.case_id}: tight control requires a SpinalCord structure")
         if spec.transform in ("tight", "unplannable"):
             feasibility = floor_for(case, goals, cfg.feasibility_file, verify_witness=spec.transform == "tight")
         return present_track5(spec.transform, case, goals, feasibility)
@@ -193,8 +195,7 @@ def run_episode(spec: EpisodeSpec, case: Case, goals: GoalList, cfg: RunConfig, 
     try:
         pres = build_presentation(spec, case, goals, cfg)
     except NotConstructible as e:
-        # The arm cannot be built on this case (Track 5 overlap or coverage_cap): no agent runs,
-        # the episode is recorded as skipped and never counted.
+        # Construction eligibility is separate from candidate-agent outcomes.
         row = episode_row(spec, cfg.agent, None, None, time.perf_counter() - t0)
         row.update({"outcome": "skipped", "t5_arm": spec.transform, "t5_label_status": "not_constructible", "t5_detail": str(e)})
         sink({"run_id": cfg.run_id, "episode_id": spec.episode_id, "event": "skipped", "detail": str(e), "ts": time.time()})
