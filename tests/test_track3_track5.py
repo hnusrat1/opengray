@@ -362,15 +362,28 @@ class Loader:
 
 
 def test_runner_track5_and_track3_end_to_end(tmp_path) -> None:
+    import scipy.sparse as sp
+
     from opengray.runner.results import load_runs, track3_table, track5_table, write_leaderboard
     from opengray.runner.run import RunConfig, run
+
+    class WitnessLoader(Loader):
+        def load(self, cid):
+            c = super().load(cid)
+            known_dose = np.full(c.n_feasible, 20.0)
+            known_dose[c.structures["PTV_7000"].mask_idx] = 70.0
+            c.D = sp.csr_matrix(sp.diags(known_dose / c.dose(np.ones(c.n_beamlets))) @ c.D)
+            return c
+
+    loader = WitnessLoader()
 
     split = tmp_path / "split.json"
     split.write_text(json.dumps({"validation": ["synthetic"]}))
     floors = tmp_path / "floors.json"
-    floors.write_text(json.dumps({"synthetic": {"SpinalCord": {"floor_gy": 20.0, "original_gy": 45.0}}}))
+    fz.save_floors(floors, {"synthetic": {"SpinalCord": {"floor_gy": 20.0, "original_gy": 45.0,
+                    "witness_w": np.ones(loader.load("synthetic").n_beamlets)}}})
     cfg5 = RunConfig(track=track_config("T5"), agent=AgentSpec("heuristic"), split="validation", seeds=[0], out_dir=tmp_path / "runs", split_file=split, rotate_transforms=False, feasibility_file=floors)
-    res5 = run(cfg5, Loader(), GOALS)
+    res5 = run(cfg5, loader, GOALS)
     assert len(res5.rows) == 3 and all(r["error"] is None for r in res5.rows)
     by = {r["t5_arm"]: r for r in res5.rows}
     # The plain synthetic case cannot carry the overlap or coverage_cap arms: recorded as skipped.
@@ -383,12 +396,12 @@ def test_runner_track5_and_track3_end_to_end(tmp_path) -> None:
     assert len(t5) == 1 and t5[0]["n_skipped"] == 2 and t5[0]["n_counted"] == 1 and t5[0]["n_lower_arm"] == 0
     # The withdrawn arm still runs when named explicitly, as uncertified and uncounted.
     cfg5u = RunConfig(track=track_config("T5"), agent=AgentSpec("heuristic"), split="validation", seeds=[0], out_dir=tmp_path / "runs_u", split_file=split, rotate_transforms=False, feasibility_file=floors, transforms=["unplannable"])
-    res5u = run(cfg5u, Loader(), GOALS)
+    res5u = run(cfg5u, loader, GOALS)
     un = res5u.rows[0]
     assert un["outcome"] == "submitted" and un["t5_correct"] is None and un["t5_escalated"] is False
     assert un["t5_label_status"] == "uncertified" and un["t5_score"] == pytest.approx(un["plan_score"]) and un["goal.SpinalCord.D0.1cc"] is not None
     cfg3 = RunConfig(track=track_config("T3"), agent=AgentSpec("heuristic"), split="validation", seeds=[0, 1], out_dir=tmp_path / "runs", split_file=split)
-    res3 = run(cfg3, Loader(), GOALS)
+    res3 = run(cfg3, loader, GOALS)
     assert len(res3.rows) == 2 and all(r["error"] is None for r in res3.rows)
     assert {r["t3_kind"] for r in res3.rows} == {"tighten_oar", "relax_target"}
     assert all(r["t5_arm"] is None and r["transform"] is None for r in res3.rows)

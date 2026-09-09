@@ -52,6 +52,9 @@ def present_tight(case: Case, goals: GoalList, feasibility: dict[str, Any]) -> P
     cord = cord_name(case)
     if cord is None or cord not in feasibility:
         raise ValueError("Track 5's tight arm needs a SpinalCord goal and a feasibility record for it (opengray feasibility)")
+    record = feasibility[cord]
+    if isinstance(record, dict) and record.get("witness_verified") is False:
+        raise NotConstructible(f"{case.case_id}: saved fluence does not verify all final hard goals for the tight control")
     true_goals = _true_goals(case, goals)
     organ_goal = _cord_goal(true_goals, cord)
     best, cert = feasibility_record(feasibility, cord)
@@ -60,6 +63,9 @@ def present_tight(case: Case, goals: GoalList, feasibility: dict[str, Any]) -> P
     limit = original if t is None else t
     meta: dict[str, Any] = {"arm": "tight", "structure": cord, "best_achieved_gy": best, "floor_gy": best, "certified_below_gy": cert, "original_gy": original, "tightened": t is not None, "presented_limit_gy": limit}
     meta["label_status"] = feasibility_status(limit, best, cert)
+    if isinstance(record, dict) and "witness_verified" in record:
+        meta["witness_verified"] = record["witness_verified"]
+        meta["witness_audit"] = record.get("witness_audit")
     shown = GoalList(name=f"{true_goals.name}+t5_tight", goals=[g.with_value(limit) if g is organ_goal else g for g in true_goals.goals], log=[*true_goals.log, f"track 5 tight: {cord} limit {original:g} -> {limit:g} Gy (best achieved {best:g}, label {meta['label_status']})"])
     return Presentation("t5_tight", case, shown, case, shown, meta=meta)
 

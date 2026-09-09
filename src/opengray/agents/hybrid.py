@@ -11,11 +11,12 @@ import numpy as np
 
 from opengray.agents.base import AgentSpec
 from opengray.agents.controller import ControllerAgent
+from opengray.agents.policy import TASK_POLICY
 from opengray.env import contract as c
 from opengray.env.tools import InProcessClient
 
-ESCALATION_REASONS = ("infeasible", "missing_structure", "contradictory_instructions", "budget", "other")
-INTERPRETER_PROMPT_VERSION = 1
+ESCALATION_REASONS = tuple(reason.value for reason in c.EscalationReason)
+INTERPRETER_PROMPT_VERSION = 2
 SUMMARY_MODES = ("reduced", "full")
 
 
@@ -125,8 +126,8 @@ def interpreter_prompt(rules: list[str]) -> str:
     lines = [
         "You are the reading half of a radiotherapy planning agent. A separate deterministic planner will write the optimization objectives; you decide only whether this case should be planned or escalated, and what to record about it.",
         "You will receive the case summary: structures present, prescriptions, the goal list (structure, metric, operator, value, unit, hard or soft, tier), a physician note (possibly empty), and the task's acceptability rules.",
-        "Escalate only for a real problem: a goal names a structure the case does not have (reason missing_structure); the physician note contradicts the goal list (reason contradictory_instructions); a hard limit is impossible to meet alongside the others (reason infeasible; be sure, since escalating a plannable case forfeits the plan); anything else that makes planning wrong (reason other).",
-        "If the case can be planned, answer plan and give flags: short statements the planner will record in its submit note, such as a note that conflicts with a goal, a structure name that looks manipulated or that does not match the goal list, goals in unexpected units, or structures in the case that no goal names. The planner follows the goal list, never the note; if you think the note should win, escalate instead.",
+        TASK_POLICY,
+        "If the case can be planned, answer plan and give flags: short factual statements the planner will record in its submit note. Identify the actual conflicting requirements when flagging a conflict. The planner follows the structured goal list.",
         "Answer with one JSON object and nothing else: {\"action\": \"plan\" or \"escalate\", \"reason\": one of " + ", ".join(ESCALATION_REASONS) + " when escalating, \"explanation\": one sentence, \"flags\": [strings]}.",
     ]
     if rules:
@@ -135,21 +136,44 @@ def interpreter_prompt(rules: list[str]) -> str:
 
 
 def parse_decision(text: str | None) -> dict[str, Any]:
+    """Validate a decision without turning missing or malformed output into permission to plan."""
+    def invalid(detail: str) -> dict[str, Any]:
+        return {"action": "error", "flags": [], "explanation": detail, "parse_error": True}
+
     if not text:
-        return {"action": "plan", "flags": [], "explanation": "empty reply", "parse_error": True}
-    m = re.search(r"\{.*\}", text, re.S)
-    if not m:
-        return {"action": "plan", "flags": [], "explanation": "no JSON in reply", "parse_error": True}
+        return invalid("empty reply")
+    raw = text.strip()
+    # A single Markdown fence is a harmless wrapper; arbitrary surrounding prose is not JSON.
+    fence = re.fullmatch(r"```(?:json)?\s*([\s\S]*?)\s*```", raw)
+    if fence:
+        raw = fence.group(1)
+
+    def unique_object(pairs):
+        out = {}
+        for key, value in pairs:
+            if key in out:
+                raise ValueError("duplicate JSON key")
+            out[key] = value
+        return out
+
     try:
-        d = json.loads(m.group(0))
-    except json.JSONDecodeError:
-        return {"action": "plan", "flags": [], "explanation": "malformed JSON", "parse_error": True}
-    action = "escalate" if str(d.get("action", "")).lower() == "escalate" else "plan"
-    reason = str(d.get("reason", "other"))
-    if reason not in ESCALATION_REASONS:
-        reason = "other"
-    flags = [str(f) for f in (d.get("flags") or []) if str(f).strip()][:8]
-    return {"action": action, "reason": reason, "explanation": str(d.get("explanation", ""))[:500], "flags": flags, "parse_error": False}
+        d = json.loads(raw, object_pairs_hook=unique_object)
+    except (ValueError, TypeError):
+        return invalid("malformed JSON")
+    if not isinstance(d, dict) or d.get("action") not in ("plan", "escalate"):
+        return invalid("action must be plan or escalate")
+    reason = d.get("reason")
+    if reason is not None and reason not in ESCALATION_REASONS:
+        return invalid("unrecognized escalation reason")
+    if d["action"] == "escalate" and reason is None:
+        return invalid("escalation requires a reason")
+    explanation = d.get("explanation", "")
+    flags = d.get("flags", [])
+    if not isinstance(explanation, str) or not isinstance(flags, list) or any(not isinstance(f, str) for f in flags):
+        return invalid("explanation and flags must contain text")
+    if d["action"] == "escalate" and not explanation.strip():
+        return invalid("escalation requires an explanation")
+    return {"action": d["action"], "reason": reason, "explanation": explanation[:4000], "flags": flags, "parse_error": False}
 
 
 def interpreter_payload(summary: c.CaseSummaryResponse, mode: str = "reduced") -> dict[str, Any]:
@@ -157,12 +181,9 @@ def interpreter_payload(summary: c.CaseSummaryResponse, mode: str = "reduced") -
     if mode not in SUMMARY_MODES:
         raise ValueError(f"summary must be one of {SUMMARY_MODES}, not {mode!r}")
     if mode == "full":
-        structures = [s.model_dump() for s in summary.structures]
-    else:
-        structures = [{"name": s.name, "volume_cc": s.volume_cc} for s in summary.structures]
+        return summary.model_dump(mode="json")
+    structures = [{"name": s.name, "volume_cc": s.volume_cc} for s in summary.structures]
     payload: dict[str, Any] = {"case_id": summary.case_id, "structures": structures, "prescriptions": summary.prescriptions, "goals": [g.model_dump() for g in summary.goals], "note": summary.note, "rules": summary.rules}
-    if mode == "full":
-        payload["beam_geometry"] = summary.beam_geometry
     return payload
 
 
@@ -186,7 +207,11 @@ class InterpreterAgent:
         reply = self.model.complete(messages, [], seed=seed, temperature=self.temperature)
         client.record_usage(reply.usage.get("tokens_in", 0), reply.usage.get("tokens_out", 0), 1)
         decision = parse_decision(reply.content)
-        client.note("interpreter", model=self.model.name, prompt_version=INTERPRETER_PROMPT_VERSION, summary=self.summary_mode, rules_disclosed=bool(summary.rules), decision=decision, reply=(reply.content or "")[:2000], cached=reply.cached, wall_s=round(time.perf_counter() - t0, 3), system_prompt=messages[0]["content"])
+        client.note("interpreter", model=reply.model or self.model.name, prompt_version=INTERPRETER_PROMPT_VERSION, summary=self.summary_mode, rules_disclosed=bool(summary.rules), decision=decision, reply=(reply.content or "")[:2000], cached=reply.cached, billing=reply.billing, wall_s=round(time.perf_counter() - t0, 3), system_prompt=messages[0]["content"])
+        if decision["parse_error"]:
+            from opengray.agents.llm import LLMError
+
+            raise LLMError("invalid interpreter decision: " + decision["explanation"])
         if decision["action"] == "escalate":
             client.escalate(decision["reason"], decision["explanation"] or "interpreter escalated")
             return

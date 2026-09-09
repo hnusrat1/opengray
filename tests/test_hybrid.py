@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from opengray.agents.base import AgentSpec, make_agent
 from opengray.agents.hybrid import (
     InterpreterAgent,
@@ -64,12 +66,38 @@ def test_preflight_checks_report_the_missing_goal_structure() -> None:
     assert esc["reason"] == "missing_structure" and p.meta["missing"] in esc["explanation"] and flags == []
 
 
-def test_parse_decision_is_forgiving() -> None:
-    d = parse_decision('Here you go: {"action": "escalate", "reason": "contradictory_instructions", "explanation": "note asks for 40 Gy cord", "flags": []}')
+def test_parse_decision_accepts_valid_json_and_single_fences() -> None:
+    d = parse_decision('```json\n{"action": "escalate", "reason": "contradictory_instructions", "explanation": "note asks for 40 Gy cord", "flags": []}\n```')
     assert d["action"] == "escalate" and d["reason"] == "contradictory_instructions" and not d["parse_error"]
-    d = parse_decision('{"action": "plan", "flags": ["the note conflicts with the goal list", ""], "reason": "bogus"}')
-    assert d["action"] == "plan" and d["flags"] == ["the note conflicts with the goal list"] and d["reason"] == "other"
-    assert parse_decision(None)["action"] == "plan" and parse_decision("no json")["parse_error"]
+    d = parse_decision('{"action": "plan", "flags": ["the note conflicts with the goal list"]}')
+    assert d["action"] == "plan" and not d["parse_error"]
+
+
+@pytest.mark.parametrize("reply", [None, "", "no json", "{}", "[]", '{"action":"continue"}',
+    '{"action":"plan","flags":"no problem"}', '{"action":"plan","flags":[{}]}',
+    '{"action":"plan","reason":"bogus"}', '{"action":"escalate"}',
+    '{"action":"escalate","reason":"infeasible"}', '{"action":"plan","action":"escalate"}',
+    'Here you go: {"action":"plan"}'])
+def test_invalid_decision_never_starts_planning(reply) -> None:
+    from opengray.agents.llm import LLMError, ModelReply
+    d = parse_decision(reply)
+    assert d["parse_error"] and d["action"] == "error"
+    session = session_for(presentation("none"))
+    model = ScriptedModel(lambda m: ModelReply(content=reply))
+    with pytest.raises(LLMError, match="invalid interpreter"):
+        InterpreterAgent(AgentSpec("interpreter"), model).run(InProcessClient(session), 0)
+    assert session.optimize_calls == 0 and session.terminal is None
+    assert any(e.get("event") == "interpreter" and e["decision"]["parse_error"] for e in session.events)
+
+
+def test_full_payload_and_task_policy_are_shared() -> None:
+    from opengray.agents.hybrid import interpreter_payload
+    from opengray.agents.llm import system_prompt
+    from opengray.agents.policy import TASK_POLICY
+    summary = InProcessClient(session_for(presentation("none"))).get_case_summary()
+    assert interpreter_payload(summary, "full") == summary.model_dump(mode="json")
+    assert TASK_POLICY in interpreter_prompt(summary.rules)
+    assert TASK_POLICY in system_prompt("T2", 3, 15)
 
 
 def test_interpreter_decisions_route_to_escalate_or_to_the_controller_with_flags() -> None:

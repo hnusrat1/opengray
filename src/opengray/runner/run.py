@@ -176,7 +176,10 @@ def build_presentation(spec: EpisodeSpec, case: Case, goals: GoalList, cfg: RunC
     if not spec.transform:
         return None
     if spec.track == "T5":
-        return present_track5(spec.transform, case, goals, floor_for(case, goals, cfg.feasibility_file))
+        feasibility = None
+        if spec.transform in ("tight", "unplannable"):
+            feasibility = floor_for(case, goals, cfg.feasibility_file, verify_witness=spec.transform == "tight")
+        return present_track5(spec.transform, case, goals, feasibility)
     feas = floor_for(case, goals, cfg.feasibility_file) if spec.transform == "infeasible_goals" else None
     return present(spec.transform, case, goals, seed=spec.seed, feasibility=feas)
 

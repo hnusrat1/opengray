@@ -1,4 +1,4 @@
-"Tool-calling language-model agent using an OpenAI-compatible chat endpoint.\n\nThe agent receives the case summary, calls the planning tools, and terminates by submission or escalation. Behavioral stopping without an explicit terminal action is recorded as automatic submission when a plan exists. Provider errors produce error records. Requests use temperature and seed settings, whose support depends on the provider. Requests and responses are recorded for reproducibility; credentials are excluded."
+"Tool-calling language-model agent using an OpenAI-compatible chat endpoint.\n\nThe agent receives the case summary, calls planning tools, and terminates by submission or escalation. Automatic terminal actions and provider failures are recorded separately. Optional provider capability filtering avoids unsupported generation settings. A persistent spending ledger can reserve request costs and retain uncertain charges. Usage, routing, and response identifiers are recorded without credentials."
 
 from __future__ import annotations
 
@@ -16,6 +16,8 @@ import httpx
 
 from opengray.agents.base import AgentSpec
 from opengray.agents.heuristic import plan_quality
+from opengray.agents.policy import TASK_POLICY
+from opengray.agents.spending import SpendingLedger, SpendingLimitError, request_cost_bound
 from opengray.env import contract as c
 
 DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
@@ -47,6 +49,7 @@ class ModelReply:
     model: str = ""
     cached: bool = False
     wall_s: float = 0.0
+    billing: dict[str, Any] = field(default_factory=dict)
 
     def as_message(self) -> dict[str, Any]:
         msg: dict[str, Any] = {"role": "assistant", "content": self.content}
@@ -150,6 +153,10 @@ class OpenAICompatibleModel:
         max_tokens: int | None = 8192,
         transport: httpx.BaseTransport | None = None,
         sleep: Callable[[float], None] = time.sleep,
+        spending: SpendingLedger | None = None,
+        price_bounds: tuple[float, float] | None = None,
+        supported_parameters: list[str] | None = None,
+        extra_headers: dict[str, str] | None = None,
     ):
         self.name = model
         self.base_url = base_url.rstrip("/")
@@ -164,8 +171,17 @@ class OpenAICompatibleModel:
         self.max_retries = max_retries
         self.max_tokens = max_tokens
         self.extra_body = dict(extra_body or {})
+        if spending is not None and price_bounds is None:
+            raise ValueError("spending ledger requires input and output price bounds")
+        self.spending = spending
+        self.price_bounds = price_bounds
+        self.supported_parameters = set(supported_parameters) if supported_parameters is not None else None
         self.cache = DiskCache(cache_dir) if cache_dir else None
         self._sleep = sleep
+        if extra_headers:
+            if any(k.lower() == "authorization" for k in extra_headers):
+                raise ValueError("extra headers cannot replace authorization")
+            headers.update(extra_headers)
         self._client = httpx.Client(base_url=self.base_url, headers=headers, timeout=timeout_s, transport=transport)
 
     def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]], *, seed: int, temperature: float = 0.0) -> ModelReply:
@@ -185,6 +201,12 @@ class OpenAICompatibleModel:
             # OpenRouter from reserving the model's full context against the credit balance.
             body["max_tokens"] = self.max_tokens
         body.update(self.extra_body)
+        if self.spending is not None and body["model"] != self.name:
+            raise ValueError("extra_body cannot change the model covered by the spending ledger")
+        if self.supported_parameters is not None:
+            for optional in ("temperature", "seed"):
+                if optional not in self.supported_parameters:
+                    body.pop(optional, None)
         key = hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         if self.cache is not None:
             hit = self.cache.get(key)
@@ -203,19 +225,48 @@ class OpenAICompatibleModel:
     def _post_with_retries(self, body: dict[str, Any]) -> dict[str, Any]:
         last = ""
         for attempt in range(self.max_retries + 1):
+            reservation = None
+            if self.spending is not None:
+                digest = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
+                try:
+                    reservation = self.spending.reserve(digest, self.name, request_cost_bound(body, *self.price_bounds))
+                except SpendingLimitError as e:
+                    raise LLMError(str(e)) from e
             try:
                 r = self._client.post("/chat/completions", json=body)
             except httpx.TransportError as e:
+                if reservation is not None:
+                    self.spending.finish(reservation, None, state="transport_error", metadata={"attempt": attempt})
                 last = f"transport error: {e}"
                 self._sleep(self._backoff(attempt))
                 continue
+            try:
+                data = r.json()
+            except ValueError:
+                data = {}
+            if reservation is not None:
+                usage = data.get("usage") or {} if isinstance(data, dict) else {}
+                cost = usage.get("cost")
+                if not isinstance(cost, (int, float)) or isinstance(cost, bool):
+                    cost = None
+                try:
+                    self.spending.finish(reservation, cost, state="response", metadata={
+                        "attempt": attempt, "status_code": r.status_code,
+                        "generation_id": data.get("id") if isinstance(data, dict) else None,
+                        "model": data.get("model") if isinstance(data, dict) else None,
+                        "provider": data.get("provider") if isinstance(data, dict) else None,
+                        "usage": usage, "response_cache_status": r.headers.get("X-OpenRouter-Cache-Status"),
+                    })
+                except (SpendingLimitError, ValueError) as e:
+                    raise LLMError(str(e)) from e
             if r.status_code == 429 or r.status_code >= 500:
                 last = f"HTTP {r.status_code}: {r.text[:300]}"
                 self._sleep(self._backoff(attempt, r.headers.get("Retry-After")))
                 continue
             if r.status_code >= 400:
                 raise LLMError(f"HTTP {r.status_code} from {self.base_url}: {r.text[:500]}")
-            data = r.json()
+            if not isinstance(data, dict):
+                raise LLMError("provider returned a non-object completion")
             if "error" in data and not data.get("choices"):
                 # OpenRouter returns 200 with an error body for some upstream failures.
                 err = data["error"]
@@ -225,6 +276,7 @@ class OpenAICompatibleModel:
                     self._sleep(self._backoff(attempt))
                     continue
                 raise LLMError(last)
+            data["_response_cache_status"] = r.headers.get("X-OpenRouter-Cache-Status")
             return data
         raise LLMError(f"gave up after {self.max_retries + 1} attempts; last: {last}")
 
@@ -255,6 +307,10 @@ class OpenAICompatibleModel:
             tool_calls=calls,
             usage={"tokens_in": int(usage.get("prompt_tokens", 0) or 0), "tokens_out": int(usage.get("completion_tokens", 0) or 0)},
             model=str(data.get("model") or self.name),
+            billing={"generation_id": data.get("id"), "provider": data.get("provider"),
+                     "usage": usage, "response_cache_status": data.get("_response_cache_status"),
+                     "system_fingerprint": data.get("system_fingerprint"),
+                     "finish_reason": data["choices"][0].get("finish_reason")},
         )
 
 
@@ -306,7 +362,7 @@ def last_tool_result(messages: list[dict[str, Any]], tool: str | None = None) ->
 # ---- prompt ----------------------------------------------------------------------------------
 
 
-PROMPT_VERSION = 3
+PROMPT_VERSION = 4  # common task policy shared with the interpreter
 
 
 def system_prompt(track: str, k: int, tool_cap: int, rules: bool = True) -> str:
@@ -359,11 +415,8 @@ def system_prompt(track: str, k: int, tool_cap: int, rules: bool = True) -> str:
         "Submit or escalate. When the budget runs out before every goal is met, submit the best plan "
         "you have and list the unmet goals in the note; on hard cases an imperfect plan with an honest "
         "note is the expected outcome, as it would be for a human planner. One optimize that misses a "
-        "goal is not evidence that the case is infeasible. Escalate instead of submitting only when the "
-        "case cannot or should not be planned as given: a structure the goals need is missing "
-        "(missing_structure), the goals contradict each other (contradictory_instructions), their units "
-        "are ambiguous (unit_ambiguity), or a limit cannot be met by any plan (infeasible). Use the "
-        "tools; do not describe what you would do. Keep any text you write short."
+        "goal is not evidence that the case is infeasible. "
+        + TASK_POLICY + " Use the tools; do not describe what you would do. Keep any text you write short."
     )
 
 
@@ -414,7 +467,7 @@ class LLMAgent:
         max_model_calls = self.max_model_calls or (2 * cap)
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_prompt(str(summary.get("track", "")), k, cap, rules=bool(summary.get("rules")))},
-            {"role": "user", "content": "Case summary (result of get_case_summary):\n" + json.dumps(summary, separators=(",", ":")) + "\n\nPlan this case. Start with set_objectives."},
+            {"role": "user", "content": "Case summary (result of get_case_summary):\n" + json.dumps(summary, separators=(",", ":")) + "\n\nPlan this case or escalate under the task policy. If planning, start with set_objectives."},
         ]
         client.note("llm_start", model=self.model.name, temperature=self.temperature, seed=seed, tool_cap=cap, max_model_calls=max_model_calls, prompt_version=PROMPT_VERSION, rules_disclosed=bool(summary.get("rules")), system_prompt=messages[0]["content"])
         best: tuple[tuple[int, float], str] | None = None
@@ -443,6 +496,7 @@ class LLMAgent:
                 cached=reply.cached,
                 wall_s=reply.wall_s,
                 usage=reply.usage,
+                billing=reply.billing,
                 content=reply.content,
                 tool_calls=[{"id": tc.id, "name": tc.name, "arguments": tc.arguments} for tc in reply.tool_calls],
             )

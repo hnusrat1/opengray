@@ -155,7 +155,7 @@ def save_floors(path: Path, floors: dict[str, dict[str, Any]]) -> None:
     tmp.replace(p)
 
 
-def floor_for(case: Case, goals: GoalList, path: Path | None, structure: str = DEFAULT_STRUCTURE) -> dict[str, dict[str, Any]]:
+def floor_for(case: Case, goals: GoalList, path: Path | None, structure: str = DEFAULT_STRUCTURE, verify_witness: bool = False) -> dict[str, dict[str, Any]]:
     """The {structure: record} map a presentation needs (best achieved dose, certificate if any),
     computed and cached on first use."""
     floors = load_floors(path) if path else {}
@@ -165,7 +165,45 @@ def floor_for(case: Case, goals: GoalList, path: Path | None, structure: str = D
         if path:
             floors.setdefault(case.case_id, {})[structure] = rec
             save_floors(path, floors)
-    return {structure: {"best_achieved_gy": float(rec.get("best_achieved_gy", rec.get("floor_gy"))), "certified_below_gy": rec.get("certified_below_gy"), "original_gy": rec.get("original_gy")}}
+    result = {"best_achieved_gy": float(rec.get("best_achieved_gy", rec.get("floor_gy"))), "certified_below_gy": rec.get("certified_below_gy"), "original_gy": rec.get("original_gy")}
+    if verify_witness:
+        audit = check_tight_witness(case, goals, rec, path, structure)
+        result["witness_verified"] = audit["valid"]
+        result["witness_audit"] = audit
+    return {structure: result}
+
+
+def check_tight_witness(case: Case, goals: GoalList, record: dict[str, Any], path: Path | None, structure: str = DEFAULT_STRUCTURE) -> dict[str, Any]:
+    """Recalculate every final hard goal from saved fluence before labelling a control feasible."""
+    w = record.get("witness_w")
+    if w is None and path and record.get("witness_file"):
+        fname = record["witness_file"]
+        if Path(fname).name != fname:
+            return {"valid": False, "detail": "invalid witness filename"}
+        file = witness_dir(path) / fname
+        if file.is_file():
+            w = np.load(file, allow_pickle=False)
+    if w is None:
+        return {"valid": False, "detail": "no saved witness fluence"}
+    w = np.asarray(w)
+    if w.shape != (case.n_beamlets,) or not np.all(np.isfinite(w)) or np.any(w < 0):
+        return {"valid": False, "detail": "invalid witness fluence"}
+    gl = goals.for_case(case).to_gy()
+    organ = next((g for g in gl.goals if g.structure == structure and g.is_upper), None)
+    if organ is None:
+        return {"valid": False, "detail": "no organ goal"}
+    best = float(record.get("best_achieved_gy", record.get("floor_gy")))
+    tightened = tightened_limit(best, organ.value)
+    limit = organ.value if tightened is None else tightened
+    dose = case.dose(w)
+    checks = []
+    for original in gl.goals:
+        if original.kind != "hard":
+            continue
+        g = original.with_value(limit) if original is organ else original
+        value = float(evaluate(case, dose, g.structure, g.spec, merge_targets=True))
+        checks.append({"goal": g.label(), "achieved_gy": value, "met": bool(g.is_met(value))})
+    return {"valid": bool(checks) and all(g["met"] for g in checks), "presented_limit_gy": limit, "goals": checks}
 
 
 def feasibility_record(feasibility: dict[str, Any], structure: str) -> tuple[float, float | None]:
